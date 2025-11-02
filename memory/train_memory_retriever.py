@@ -11,7 +11,7 @@ from torch.utils.data import Dataset, DataLoader, Subset
 from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 
-
+# 用 Sentence-BERT（一个语义编码模型）分别编码两个句子，然后拼接它们的特征向量，通过一个全连接分类器判断它们之间的关系（例如：是否相似、是否匹配、是否触发记忆检索等）
 class MemoryRetrieverClassifier(nn.Module):
     def __init__(self, sentence_bert: AutoModel):
         super().__init__()
@@ -23,12 +23,15 @@ class MemoryRetrieverClassifier(nn.Module):
             nn.Dropout(0.2),
             nn.Linear(512, 2)
         )
+        
     def forward(self, ids1, mask1, ids2, mask2):
+        # 输入两句话的 token ids 和 attention mask
+        # 取出每个句子的 [CLS] 向量（last_hidden_state[:, 0]）作为句子语义表示
         o1 = self.sentence_bert(ids1, attention_mask=mask1).last_hidden_state[:, 0]
         o2 = self.sentence_bert(ids2, attention_mask=mask2).last_hidden_state[:, 0]
         return self.classifier(torch.cat([o1, o2], dim=1))
 
-
+# 把一个“计划字段”（plan_field）统一转换成可解析的结构化数据（字典或列表），无论它原来是什么类型（None、字符串、字典或列表）。
 def _parse_plan(plan_field: Union[str, dict, list, None]) -> Optional[Union[dict, list]]:
     if plan_field is None:
         return None
@@ -39,12 +42,12 @@ def _parse_plan(plan_field: Union[str, dict, list, None]) -> Optional[Union[dict
         if not s:
             return None
         try:
-            return json.loads(s)
+            return json.loads(s) # 把字符串 s 当作 JSON 字符串解析
         except Exception:
             return {"plan": [{"description": s}]}
     return None
 
-
+# 把一个计划对象（plan_obj）格式化成可读的文本字符串，类似“步骤清单”的形式
 def _pretty_plan(plan_obj: Union[dict, list]) -> str:
     try:
         steps = []
@@ -52,7 +55,7 @@ def _pretty_plan(plan_obj: Union[dict, list]) -> str:
             for item in plan_obj["plan"]:
                 if isinstance(item, dict):
                     sid = item.get("id")
-                    desc = item.get("description") or item.get("desc") or item.get("step") or str(item)
+                    desc = item.get("description") or item.get("desc") or item.get("step") or str(item) # 得到description或者step
                     steps.append(f"{sid}. {desc}" if sid is not None else f"- {desc}")
                 else:
                     steps.append(f"- {str(item)}")
@@ -65,11 +68,11 @@ def _pretty_plan(plan_obj: Union[dict, list]) -> str:
                     steps.append(f"{i}. {str(item)}")
         else:
             return json.dumps(plan_obj, ensure_ascii=False)
-        return "\n".join(steps) if steps else json.dumps(plan_obj, ensure_ascii=False)
+        return "\n".join(steps) if steps else json.dumps(plan_obj, ensure_ascii=False) # 如果成功收集到了步骤列表，就用换行符拼接成多行字符串
     except Exception:
         return json.dumps(plan_obj, ensure_ascii=False)
 
-
+# 从一个 JSON Lines 文件（.jsonl）中读取成对数据（query + case + plan + label）并转化为模型可用格式
 class PairJsonlDataset(Dataset):
     def __init__(self, path: str, use_plan: bool = True, plan_style: str = "pretty",
                  section_tokens: Tuple[str, str] = ("[CASE]", "[PLAN]")):
@@ -217,6 +220,7 @@ def main():
     parser.add_argument("--save_best", action="store_true")
     parser.add_argument("--class_weight_pos", type=float, default=None)
     args = parser.parse_args()
+    
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
@@ -229,6 +233,8 @@ def main():
     backbone = AutoModel.from_pretrained(tok_src)
     model = MemoryRetrieverClassifier(backbone).to(device)
     collate = Collator(tokenizer, max_len=args.max_len)
+
+    # 显式提供验证集
     if args.valid:
         train_ds = PairJsonlDataset(args.train, use_plan=args.use_plan, plan_style=args.plan_style,
                                     section_tokens=tuple(args.section_tokens))
@@ -238,12 +244,15 @@ def main():
         valid_loader = DataLoader(valid_ds, batch_size=args.batch_size, shuffle=False, num_workers=2, collate_fn=collate)
         pos = sum(x["label"] for x in train_ds.samples)
         neg = len(train_ds) - pos
+    # 只给训练集
     else:
+        # 在训练集内部切分出验证集；默认分层抽样（保持正负比例）
         full_ds = PairJsonlDataset(args.train, use_plan=args.use_plan, plan_style=args.plan_style,
                                    section_tokens=tuple(args.section_tokens))
         tr_idx, va_idx = stratified_split_indices(
             full_ds.labels(), val_ratio=args.val_ratio, seed=args.seed, stratify=not args.no_stratify
         )
+        
         train_ds = Subset(full_ds, tr_idx)
         valid_ds = Subset(full_ds, va_idx)
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2, collate_fn=collate)
@@ -252,24 +261,29 @@ def main():
         pos = count_pos_in_subset(full_ds, tr_idx)
         neg = len(tr_idx) - pos
 
+    # 分组权重衰减（AdamW 经典做法）：对 bias/LayerNorm 等不做 weight decay，其余做 weight decay。
     no_decay = ["bias", "LayerNorm.weight", "layer_norm", "ln"]
     grouped_params = [
         {"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], "weight_decay": args.weight_decay},
         {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
     ]
     optimizer = torch.optim.AdamW(grouped_params, lr=args.lr)
+
+    # 线性 warmup + 线性下降
     total_steps = len(train_loader) * args.epochs
     warmup_steps = int(total_steps * args.warmup_ratio)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
+    
+    # 类别不平衡处理：正类权重可指定；否则按样本比例自动放大正类权重。
     if args.class_weight_pos is not None:
         weight = torch.tensor([1.0, float(args.class_weight_pos)], device=device)
-    else:
+    else: # 自动估计：w_pos = max(1, neg/pos)
         weight = None
         if pos > 0 and neg > 0:
             w_pos = max(1.0, neg / max(1, pos))
             weight = torch.tensor([1.0, float(w_pos)], device=device)
     criterion = nn.CrossEntropyLoss(weight=weight)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
+    scaler = torch.cuda.amp.GradScaler(enabled=args.fp16) # 混合精度
     global_step, best_metric = 0, -1.0
     best_path = os.path.join(args.output_dir, "best.pt")
 
@@ -298,7 +312,7 @@ def main():
             epoch_loss += loss.item()
             global_step += 1
 
-            if args.eval_every > 0 and global_step % args.eval_every == 0:
+            if args.eval_every > 0 and global_step % args.eval_every == 0: # 按 --eval_every 步在验证集评估一次
                 metrics = evaluate(model, valid_loader, device)
                 acc, f1, auc = metrics["acc"], metrics["f1"], metrics["auc"]
                 print(f"[step {global_step}] val_acc={acc:.4f} val_f1={f1:.4f} val_auc={auc:.4f}")
@@ -319,7 +333,7 @@ def main():
             torch.save(model.state_dict(), best_path)
             print(f"  -> best updated: {best_path}")
 
-    final_path = os.path.join(args.output_dir, "last.pt")
+    final_path = os.path.join(args.output_dir, "last.pt") # 保存 checkpoint
     torch.save(model.state_dict(), final_path)
     print(f"Training done. Final: {final_path}")
     if args.save_best and os.path.exists(best_path):
