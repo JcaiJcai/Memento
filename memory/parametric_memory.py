@@ -6,6 +6,8 @@ from transformers import AutoTokenizer, AutoModel
 
 from train_memory_retriever import MemoryRetrieverClassifier, _parse_plan, _pretty_plan
 
+# 一个“案例检索器（Case Retriever）”，用于在一堆病例/案例数据中，根据输入的自然语言查询（query）检索出最相似的案例（case+plan）。
+# 它使用前面训练好的 MemoryRetrieverClassifier 模型 来判断“query 与案例（含 plan）”是否匹配。
 
 class CaseRetriever:
     def __init__(
@@ -21,6 +23,7 @@ class CaseRetriever:
         self.model.load_state_dict(torch.load(model_path, map_location=self.device))
         self.model.eval()
 
+    # 批量计算相似分数
     @torch.inference_mode()
     def _score_batch(self, natural: List[str], icl: List[str]) -> torch.Tensor:
         t1 = self.tokenizer(icl, padding=True, truncation=True, return_tensors="pt")
@@ -30,6 +33,9 @@ class CaseRetriever:
         logits = self.model(ids1, mask1, ids2, mask2)
         return torch.softmax(logits, dim=1)[:, 1]
 
+    # 对每个案例计算分数；
+    # 保存案例文本、分数、索引、标签等；
+    # 返回一个结果列表。
     def retrieve(self, natural_prompt: str, icl_pool: List[str], metadata: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         probs = self._score_batch([natural_prompt] * len(icl_pool), icl_pool)
         results = []
@@ -44,7 +50,8 @@ class CaseRetriever:
             })
         return results
 
-
+# 用 [CASE] 和 [PLAN] 标签拼接案例文本；
+# 如果 plan 是结构化对象，调用 _parse_plan() + _pretty_plan() 转成人类可读的格式；
 def build_icl_text(case: str, plan) -> str:
     parts = ["[CASE]", str(case)]
     if plan is not None:
@@ -52,7 +59,13 @@ def build_icl_text(case: str, plan) -> str:
         parts += ["[PLAN]", _pretty_plan(pobj) if pobj is not None else str(plan)]
     return "\n".join(parts).strip()
 
-
+# 从 .jsonl 文件中逐行读取；
+# 每一行必须包含 "case"；
+# 用 build_icl_text() 构造可输入模型的文本；
+# 同时保存 metadata（原始信息：case、plan、标签等）；
+# 返回：
+# icl_pool: [CASE]\n[PLAN] 文本列表；
+# metadata: 对应的原始字典信息。
 def load_pool(path: str) -> Tuple[List[str], List[Dict[str, Any]]]:
     pool = []
     metadata = []
